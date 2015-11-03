@@ -1,0 +1,38 @@
+{
+  "name": "kws-media-api",
+  "description": "Media API for the Kurento Web SDK",
+  "license": "LGPL",
+  "keywords": [
+    "API",
+    "Kurento",
+    "KWS",
+    "media",
+    "SDK",
+    "web",
+    "WebRTC"
+  ],
+  "homepage": "http://www.kurento.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kurento/kws-media-api.git"
+  },
+  "authors": [
+    "Kurento <info@kurento.com> (http://kurento.org)",
+    {
+      "name": "Jesús Leganés Combarro 'piranna'",
+      "email": "piranna@gmail.com",
+      "url": "http://pirannafs.blogspot.com.es"
+    }
+  ],
+  "main": "js/kws-media-api.js",
+  "version": "4.3.22",
+  "_release": "4.3.22",
+  "_resolution": {
+    "type": "version",
+    "tag": "4.3.22",
+    "commit": "9cdc1d1bbb2865b8a897f59ee32fc6985f4267f2"
+  },
+  "_source": "git://github.com/Kurento/kws-media-api-bower.git",
+  "_target": "4.3.22",
+  "_originalSource": "kws-media-api"
+}

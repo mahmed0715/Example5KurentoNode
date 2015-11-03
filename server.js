@@ -1,0 +1,958 @@
+/*
+ * (C) Copyright 2014 Kurento (http://kurento.org/)
+ *
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the GNU Lesser General Public License
+ * (LGPL) version 2.1 which accompanies this distribution, and is available at
+ * http://www.gnu.org/licenses/lgpl-2.1.html
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * Lesser General Public License for more details.
+ *
+ */
+
+var path = require('path');
+var fs = require('fs');
+var express = require('express');
+var ws = require('ws');
+var minimist = require('minimist');
+var url = require('url');
+var kurento = require('kurento-client');
+
+
+
+var argv = minimist(process.argv.slice(2), {
+    default: {
+        as_uri: "http://localhost:8080/",
+        ws_uri: "ws://localhost:8888/kurento"
+    }
+});
+
+var app = express();
+
+
+var mediaDir = '//tmp';
+if(!fs.existsSync(mediaDir)){
+    fs.mkdir(mediaDir,function(error){
+    if(error){
+        mediaDir = '//tmp';
+        console.log('media directory creation error , using //tmp dir',error);
+        return;
+    }
+  
+    console.log('media folder created, using //tmp/media dir');
+    });
+}
+/*
+ * Definition of global variables.
+ */
+var composite = null;
+var mediaPipeline = null;
+var kurentoClient = null;
+var userRegistry = new UserRegistry();
+var pipelines = {};
+var candidatesQueue = {};
+var idCounter = 0;
+
+function nextUniqueId() {
+    idCounter++;
+    return idCounter.toString();
+}
+
+/*
+ * Definition of helper classes
+ */
+
+// Represents caller and callee sessions
+function UserSession(id, name, ws) {
+    this.id = id;
+    this.name = name;
+    this.ws = ws;
+    this.peer = null;
+    this.sdpOffer = null;
+}
+
+UserSession.prototype.sendMessage = function(message) {
+    this.ws.send(JSON.stringify(message));
+}
+
+// Represents registrar of users
+function UserRegistry() {
+    this.usersById = {};
+    this.usersByName = {};
+}
+
+UserRegistry.prototype.register = function(user) {
+    this.usersById[user.id] = user;
+    this.usersByName[user.name] = user;
+}
+
+UserRegistry.prototype.unregister = function(id) {
+    var user = this.getById(id);
+    if (user)
+        delete this.usersById[id]
+    if (user && this.getByName(user.name))
+        delete this.usersByName[user.name];
+}
+
+UserRegistry.prototype.getById = function(id) {
+    return this.usersById[id];
+}
+
+UserRegistry.prototype.getByName = function(name) {
+    return this.usersByName[name];
+}
+
+UserRegistry.prototype.removeById = function(id) {
+    var userSession = this.usersById[id];
+    if (!userSession)
+        return;
+    delete this.usersById[id];
+    delete this.usersByName[userSession.name];
+}
+
+// Represents a B2B active call
+function CallMediaPipeline() {
+    this.pipeline = null;
+    this.webRtcEndpoint = {};
+    this.recordRtcEngpoint = {};
+}
+
+CallMediaPipeline.prototype.createPipeline = function(callerId, calleeId, ws, callback) {
+    var self = this;
+    getKurentoClient(function(error, kurentoClient) {
+        if (error) {
+            return callback(error);
+        }
+
+        kurentoClient.create('MediaPipeline', function(error, pipeline) {
+            if (error) {
+                return callback(error);
+            }
+
+            pipeline.create('WebRtcEndpoint', function(error, callerWebRtcEndpoint) {
+                if (error) {
+                    pipeline.release();
+                    return callback(error);
+                }
+
+                if (candidatesQueue[callerId]) {
+                    while (candidatesQueue[callerId].length) {
+                        var candidate = candidatesQueue[callerId].shift();
+                        callerWebRtcEndpoint.addIceCandidate(candidate);
+                    }
+                }
+                pipeline.create('FaceOverlayFilter', function(error, faceOverlayFilter) {
+                    if (error) {
+                        return callback(error);
+                    }
+
+                    faceOverlayFilter.setOverlayedImage(url.format(asUrl) + 'img/mario-wings.png',
+                            -0.35, -1.2, 1.6, 1.6, function(error) {
+                                if (error) {
+                                    return callback(error);
+                                }
+                                connectMediaElements(callerWebRtcEndpoint, faceOverlayFilter, function(error) {
+                                    if (error) {
+                                        pipeline.release();
+                                        return callback(error);
+                                    }
+                                });
+                                //return callback(null, callerWebRtcEndpoint, faceOverlayFilter);
+                            });
+                });
+                //record start
+                
+                recordParams = {
+                    uri: "file:/"+mediaDir+"/call-"+callerId+".webm" //The media server user must have wirte permissions for creating this file
+                };
+                console.log('Media:' + recordParams.uri);
+                pipeline.create("RecorderEndpoint", recordParams, function(error, recorderEndpoint) {
+                    if (error) {
+                        console.log("Recorder problem");
+                        return sendError(res, 500, error);
+                    }
+
+                    callerWebRtcEndpoint.recordRtcendpoint = recorderEndpoint;
+                    recorderEndpoint.record();
+                    connectMediaElements(callerWebRtcEndpoint, recorderEndpoint, function(error) {
+                        if (error) {
+                            pipeline.release();
+                            return callback(error);
+                        }
+                    });
+                
+                });
+                //record end
+                callerWebRtcEndpoint.on('OnIceCandidate', function(event) {
+                    var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
+                    userRegistry.getById(callerId).ws.send(JSON.stringify({
+                        id: 'iceCandidate',
+                        candidate: candidate
+                    }));
+                });
+
+                pipeline.create('WebRtcEndpoint', function(error, calleeWebRtcEndpoint) {
+                    if (error) {
+                        pipeline.release();
+                        return callback(error);
+                    }
+
+                    if (candidatesQueue[calleeId]) {
+                        while (candidatesQueue[calleeId].length) {
+                            var candidate = candidatesQueue[calleeId].shift();
+                            calleeWebRtcEndpoint.addIceCandidate(candidate);
+                        }
+                    }
+                    pipeline.create('FaceOverlayFilter', function(error, faceOverlayFilter) {
+                        if (error) {
+                            return callback(error);
+                        }
+
+                        faceOverlayFilter.setOverlayedImage(url.format(asUrl) + 'img/Hat.png',
+                                -0.35, -1.2, 1.6, 1.6, function(error) {
+                                    if (error) {
+                                        return callback(error);
+                                    }
+                                    connectMediaElements(calleeWebRtcEndpoint, faceOverlayFilter, function(error) {
+                                        if (error) {
+                                            pipeline.release();
+                                            return callback(error);
+                                        }
+                                    });
+                                    //  return callback(null, calleeWebRtcEndpoint, faceOverlayFilter);
+                                });
+                        //record start
+                        recordParams = {
+                            uri: "file:/"+mediaDir+"/call-"+calleeId+".webm" //The media server user must have wirte permissions for creating this file
+                        };
+                        pipeline.create("RecorderEndpoint", recordParams, function(error, recorderEndpoint) {
+                            if (error) {
+                                console.log("Recorder problem");
+                                return sendError(res, 500, error);
+                            }
+                            recorderEndpoint.record();
+                            calleeWebRtcEndpoint.recordRtcendpoint = recorderEndpoint;
+                            connectMediaElements(calleeWebRtcEndpoint, recorderEndpoint, function(error) {
+                                if (error) {
+                                    pipeline.release();
+                                    return callback(error);
+                                }
+                            });
+                           
+                        });
+                        //record end
+                    });
+                    calleeWebRtcEndpoint.on('OnIceCandidate', function(event) {
+                        var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
+                        userRegistry.getById(calleeId).ws.send(JSON.stringify({
+                            id: 'iceCandidate',
+                            candidate: candidate
+                        }));
+                    });
+
+                    callerWebRtcEndpoint.connect(calleeWebRtcEndpoint, function(error) {
+                        if (error) {
+                            pipeline.release();
+                            return callback(error);
+                        }
+
+                        calleeWebRtcEndpoint.connect(callerWebRtcEndpoint, function(error) {
+                            if (error) {
+                                pipeline.release();
+                                return callback(error);
+                            }
+                        });
+
+
+                        self.pipeline = pipeline;
+                        self.webRtcEndpoint[callerId] = callerWebRtcEndpoint;
+                        self.webRtcEndpoint[calleeId] = calleeWebRtcEndpoint;
+                        callback(null);
+                    });
+                });
+            });
+        });
+    })
+}
+// Retrieve or create composite hub
+function getComposite(callback) {
+    if (composite !== null) {
+        console.log("Composer already created");
+        return callback(null, composite, mediaPipeline);
+    }
+    getMediaPipeline(function(error, _pipeline) {
+        if (error) {
+            return callback(error);
+        }
+        _pipeline.create('Composite', function(error, _composite) {
+            console.log("creating Composite");
+            if (error) {
+                return callback(error);
+            }
+            composite = _composite;
+            callback(null, composite);
+        });
+    });
+}
+// Retrieve or create mediaPipeline
+function getMediaPipeline(callback) {
+    if (mediaPipeline !== null) {
+        console.log("MediaPipeline already created");
+        return callback(null, mediaPipeline);
+    }
+    getKurentoClient(function(error, _kurentoClient) {
+        if (error) {
+            return callback(error);
+        }
+        _kurentoClient.create('MediaPipeline', function(error, _pipeline) {
+            console.log("creating MediaPipeline");
+            if (error) {
+                return callback(error);
+            }
+            mediaPipeline = _pipeline;
+            callback(null, mediaPipeline);
+        });
+    });
+}
+
+// Create a hub port
+function createHubPort(callback) {
+    getComposite(function(error, _composite) {
+        if (error) {
+            return callback(error);
+        }
+        _composite.createHubPort(function(error, _hubPort) {
+            console.info("Creating hubPort");
+            if (error) {
+                return callback(error);
+            }
+            callback(null, _hubPort);
+        });
+    });
+}
+
+function connectMediaElements(webRtcEndpoint, faceOverlayFilter, callback) {
+    webRtcEndpoint.connect(faceOverlayFilter, function(error) {
+        if (error) {
+            return callback(error);
+        }
+
+        faceOverlayFilter.connect(webRtcEndpoint, function(error) {
+            if (error) {
+                return callback(error);
+            }
+
+            return callback(null);
+        });
+    });
+}
+CallMediaPipeline.prototype.generateSdpAnswer = function(id, sdpOffer, callback) {
+    this.webRtcEndpoint[id].processOffer(sdpOffer, callback);
+    this.webRtcEndpoint[id].gatherCandidates(function(error) {
+        if (error) {
+            return callback(error);
+        }
+    });
+}
+
+CallMediaPipeline.prototype.release = function() {
+    if (this.pipeline)
+        this.pipeline.release();
+    this.pipeline = null;
+}
+function createMediaElements(pipeline, ws, callback) {
+    pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
+        if (error) {
+            return callback(error);
+        }
+
+        pipeline.create('FaceOverlayFilter', function(error, faceOverlayFilter) {
+            if (error) {
+                return callback(error);
+            }
+
+            faceOverlayFilter.setOverlayedImage(url.format(asUrl) + 'img/mario-wings.png',
+                    -0.35, -1.2, 1.6, 1.6, function(error) {
+                        if (error) {
+                            return callback(error);
+                        }
+
+                        return callback(null, webRtcEndpoint, faceOverlayFilter);
+                    });
+        });
+    });
+}
+
+function connectMediaElements(webRtcEndpoint, faceOverlayFilter, callback) {
+    webRtcEndpoint.connect(faceOverlayFilter, function(error) {
+        if (error) {
+            return callback(error);
+        }
+
+        faceOverlayFilter.connect(webRtcEndpoint, function(error) {
+            if (error) {
+                return callback(error);
+            }
+
+            return callback(null);
+        });
+    });
+}
+/*
+ * Server startup
+ */
+
+var asUrl = url.parse(argv.as_uri);
+var port = asUrl.port;
+var server = app.listen(port, function() {
+    console.log('Kurento Tutorial started');
+    console.log('Open ' + url.format(asUrl) + ' with a WebRTC capable browser');
+});
+
+var wss = new ws.Server({
+    server: server,
+    path: '/one2one'
+});
+
+wss.on('connection', function(ws) {
+    var sessionId = nextUniqueId();
+    console.log('Connection received with sessionId ' + sessionId);
+
+    ws.on('error', function(error) {
+        console.log('Connection ' + sessionId + ' error');
+        stop(sessionId);
+    });
+
+    ws.on('close', function() {
+        console.log('Connection ' + sessionId + ' closed');
+        stop(sessionId);
+        userRegistry.unregister(sessionId);
+    });
+
+    ws.on('message', function(_message) {
+        var message = JSON.parse(_message);
+        console.log('--------Connection ' + sessionId + ' received message ', message);
+
+        switch (message.id) {
+            case 'register':
+                register(sessionId, message.name, ws);
+                break;
+
+            case 'call':
+                call(sessionId, message.to, message.from, message.sdpOffer);
+                break;
+
+            case 'incomingCallResponse':
+                incomingCallResponse(sessionId, message.from, message.callResponse, message.sdpOffer, ws);
+                break;
+
+            case "play":
+                sendMediaUri(message, ws, sessionId);
+                break;
+
+            case 'stop':
+                stop(sessionId);
+                break;
+
+            case 'onIceCandidate':
+                console.log("oniceCandidate:");
+                onIceCandidate(sessionId, message.candidate);
+                break;
+
+            default:
+                ws.send(JSON.stringify({
+                    id: 'error',
+                    message: 'Invalid message ' + message
+                }));
+                break;
+        }
+
+    });
+});
+function onError(error) {
+    console.log(error);
+}
+function sendMediaUri(message, ws, sessionId){
+    var uri = "call-"+sessionId+".webm";
+     userRegistry.getById(sessionId).ws.send(JSON.stringify({
+                        id: 'playResponse',
+                        response: 'accepted',
+                        
+                        uri: uri
+                    }));
+}
+function setIceCandidateCallbacks(webRtcPeer, webRtcEp, onerror)
+{
+  webRtcPeer.on('icecandidate', function(candidate) {
+    console.log("Local candidate:",candidate);
+
+    candidate = kurentoClient.register.complexTypes.IceCandidate(candidate);
+
+    webRtcEp.addIceCandidate(candidate, onerror)
+  });
+
+  webRtcEp.on('OnIceCandidate', function(event) {
+    var candidate = event.candidate;
+
+    console.log("Remote candidate:",candidate);
+
+    webRtcPeer.addIceCandidate(candidate, onerror);
+  });
+}
+
+function play2(){
+   getKurentoClient(function(error, kurentoClient) {
+        if (error) {
+            return callback(error);
+        }
+      kurentoClient.create('MediaPipeline', function(error, pipeline) {
+        if (error) return onError(error);
+
+        pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
+          if (error) return onError(error);
+
+          setIceCandidateCallbacks( webRtcEndpoint, onError);
+
+          webRtcEndpoint.processOffer(offer, function(error, answer) {
+            if (error) return onError(error);
+
+            webRtcEndpoint.gatherCandidates(onError);
+
+            webRtcPeer.processAnswer(answer);
+          });
+
+          var options = {uri : argv.file_uri}
+
+          pipeline.create("PlayerEndpoint", options, function(error, player) {
+            if (error) return onError(error);
+
+            player.on('EndOfStream', function(event){
+              pipeline.release();
+              //videoPlayer.src = "";
+            });
+
+            player.connect(webRtcEndpoint, function(error) {
+              if (error) return onError(error);
+
+              player.play(function(error) {
+                if (error) return onError(error);
+                console.log("Playing ...");
+              });
+            });
+
+            /*document.getElementById("stopPlayButton").addEventListener("click",
+            function(event){
+              pipeline.release();
+              webRtcPeer.dispose();
+              //videoPlayer.src="";
+            })*/
+          });
+        });
+      });
+    });
+  };
+
+function play1() {
+    var file_uri = "http://files.kurento.org/video/sintel.webm"; //requires Internet connectivity
+    getKurentoClient(function(error, kurentoClient) {
+        return onError(error);
+
+        kurentoClient.create("MediaPipeline", function(error, pipeline) {
+            if (error)
+                return onError(error);
+
+            pipeline.create("HttpGetEndpoint", function(error, httpGetEndpoint) {
+                if (error)
+                    return onError(error);
+
+                pipeline.create("PlayerEndpoint", {uri: file_uri}, function(error, playerEndpoint) {
+                    if (error)
+                        return onError(error);
+                    playerEndpoint.connect(httpGetEndpoint, function(error) {
+                        if (error)
+                            return onError(error);
+                        httpGetEndpoint.connect(playerEndpoint, function(error) {
+                            if (error)
+                                return onError(error);
+                            httpGetEndpoint.getUrl(function(error, url) {
+                                if (error)
+                                    return onError(error);
+                              //  videoInput.src = url;
+                            });
+
+                            playerEndpoint.on("EndOfStream", function(event) {
+                                pipeline.release();
+                             //   videoInput.src = "";
+                            });
+
+                            playerEndpoint.play(function(error) {
+                                if (error)
+                                    return onError(error);
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    }, onError);
+}
+function play(message, ws, sessionId) {
+    console.log('Creating kurentoClient');
+    getKurentoClient(function(error, kurentoClient) {
+
+
+
+        if (error)
+            return onError( error);
+
+        // Create pipline
+        console.log('Creating MediaPipline');
+        kurentoClient.create('MediaPipeline', function(error, pipeline) {
+            if (error)
+                return onError(error);
+            pipeline.create('WebRtcEndpoint', function(error, webRtcEndpoint) {
+                if (error)
+                    return onError(error);
+                webRtcEndpoint.on('OnIceCandidate', function(event) {
+                    console.log("");
+                    var candidate = kurento.register.complexTypes.IceCandidate(event.candidate);
+                    userRegistry.getById(sessionId).ws.send(JSON.stringify({
+                        id: 'iceCandidate',
+                        candidate: candidate
+                    }));
+                    
+                     webRtcEndpoint.addIceCandidate(candidate);
+                });
+                webRtcEndpoint.processOffer(message.sdpOffer, function(error, sdpAnswer) {
+                    if (error)
+                        return onError(error);
+                    // Create player
+                    console.log('Creating PlayerEndpoint');
+                    userRegistry.getById(sessionId).ws.send(JSON.stringify({
+                        id: 'playResponse',
+                        response: 'accepted',
+                        sdpAnswer: sdpAnswer
+                    }));
+                    //  var rtsp_uri = "file:///tmp/media/call.webm";
+                    var rtsp_uri = "http://files.kurento.org/video/sintel.webm";
+                    pipeline.create('PlayerEndpoint', {uri: rtsp_uri}, function(error, playerEndpoint) {
+                        if (error)
+                            return onError(error);
+
+                        playerEndpoint.on('EndOfStream', function() {
+                            console.log('END OF STREAM');
+                            pipeline.release();
+                        });
+
+                        console.log('Now Playing');
+                        connectMediaElements(webRtcEndpoint, playerEndpoint, function(error) {
+
+                            if (error)
+                                pipeline.release();
+                            pipelines[sessionId] = pipeline;
+                            console.log('Connecting to endpoint');
+                            pipelines[sessionId].webRtcEndpoint = webRtcEndpoint;
+                            pipelines[sessionId].webRtcEndpoint[sessionId] = webRtcEndpoint;
+
+                            playerEndpoint.play(function(error) {
+                                if (error)
+                                    return onError(error);
+
+                                // Create WebRtc
+                                console.log('Creating WebRTCEndpoint');
+
+
+                                console.log('Processing SDP offer');
+
+
+                                console.log('Connected!');
+
+                            });
+                        });
+                    });
+                });
+            });
+        });
+
+    });
+
+}
+function startPlaying()
+{
+  console.log("Start playing");
+
+  var videoPlayer = document.getElementById('videoPlayer');
+
+  var options = {
+    remoteVideo: videoPlayer
+  };
+
+  if (args.ice_servers) {
+    console.log("Use ICE servers: " + args.ice_servers);
+    options.configuration = {
+      iceServers : JSON.parse(args.ice_servers)
+    };
+  } else {
+    console.log("Use freeice")
+  }
+
+  var webRtcPeer = kurentoUtils.WebRtcPeer.WebRtcPeerRecvonly(options,
+  function(error)
+  {
+    if(error) return onError(error)
+
+    this.generateOffer(onPlayOffer)
+  });
+
+  function onPlayOffer(error, offer) {
+    if (error) return onError(error);
+
+    kurentoClient(args.ws_uri, function(error, client) {
+      if (error) return onError(error);
+
+      client.create('MediaPipeline', function(error, pipeline) {
+        if (error) return onError(error);
+
+        pipeline.create('WebRtcEndpoint', function(error, webRtc) {
+          if (error) return onError(error);
+
+          setIceCandidateCallbacks(webRtcPeer, webRtc, onError)
+
+          webRtc.processOffer(offer, function(error, answer) {
+            if (error) return onError(error);
+
+            webRtc.gatherCandidates(onError);
+
+            webRtcPeer.processAnswer(answer);
+          });
+
+          var options = {uri : args.file_uri}
+
+          pipeline.create("PlayerEndpoint", options, function(error, player) {
+            if (error) return onError(error);
+
+            player.on('EndOfStream', function(event){
+              pipeline.release();
+              videoPlayer.src = "";
+            });
+
+            player.connect(webRtc, function(error) {
+              if (error) return onError(error);
+
+              player.play(function(error) {
+                if (error) return onError(error);
+                console.log("Playing ...");
+              });
+            });
+
+            document.getElementById("stopPlayButton").addEventListener("click",
+            function(event){
+              pipeline.release();
+              webRtcPeer.dispose();
+              videoPlayer.src="";
+            })
+          });
+        });
+      });
+    });
+  };
+}
+
+// Recover kurentoClient for the first time.
+function getKurentoClient(callback) {
+    if (kurentoClient !== null) {
+        return callback(null, kurentoClient);
+    }
+
+    kurento(argv.ws_uri, function(error, _kurentoClient) {
+        if (error) {
+            var message = 'Coult not find media server at address ' + argv.ws_uri;
+            return callback(message + ". Exiting with error " + error);
+        }
+
+        kurentoClient = _kurentoClient;
+        callback(null, kurentoClient);
+    });
+}
+
+function stop(sessionId) {
+    if (!pipelines[sessionId]) {
+        return;
+    }
+    console.log('sessionid:', sessionId);
+    var pipeline = pipelines[sessionId];
+    delete pipelines[sessionId];
+    pipeline.release();
+    var stopperUser = userRegistry.getById(sessionId);
+    var stoppedUser = userRegistry.getByName(stopperUser.peer);
+    stopperUser.peer = null;
+
+    if (stoppedUser) {
+        stoppedUser.peer = null;
+        delete pipelines[stoppedUser.id];
+        var message = {
+            id: 'stopCommunication',
+            message: 'remote user hanged out'
+        }
+        stoppedUser.sendMessage(message)
+    }
+
+    clearCandidatesQueue(sessionId);
+}
+
+function incomingCallResponse(calleeId, from, callResponse, calleeSdp, ws) {
+
+    clearCandidatesQueue(calleeId);
+
+    function onError(callerReason, calleeReason) {
+        if (pipeline)
+            pipeline.release();
+        if (caller) {
+            var callerMessage = {
+                id: 'callResponse',
+                response: 'rejected'
+            }
+            if (callerReason)
+                callerMessage.message = callerReason;
+            caller.sendMessage(callerMessage);
+        }
+
+        var calleeMessage = {
+            id: 'stopCommunication'
+        };
+        if (calleeReason)
+            calleeMessage.message = calleeReason;
+        callee.sendMessage(calleeMessage);
+    }
+
+    var callee = userRegistry.getById(calleeId);
+    if (!from || !userRegistry.getByName(from)) {
+        return onError(null, 'unknown from = ' + from);
+    }
+    var caller = userRegistry.getByName(from);
+
+    if (callResponse === 'accept') {
+        var pipeline = new CallMediaPipeline();
+        pipelines[caller.id] = pipeline;
+        pipelines[callee.id] = pipeline;
+
+        pipeline.createPipeline(caller.id, callee.id, ws, function(error) {
+            if (error) {
+                return onError(error, error);
+            }
+
+            pipeline.generateSdpAnswer(caller.id, caller.sdpOffer, function(error, callerSdpAnswer) {
+                if (error) {
+                    return onError(error, error);
+                }
+
+                pipeline.generateSdpAnswer(callee.id, calleeSdp, function(error, calleeSdpAnswer) {
+                    if (error) {
+                        return onError(error, error);
+                    }
+
+                    var message = {
+                        id: 'startCommunication',
+                        sdpAnswer: calleeSdpAnswer
+                    };
+                    callee.sendMessage(message);
+
+                    message = {
+                        id: 'callResponse',
+                        response: 'accepted',
+                        sdpAnswer: callerSdpAnswer
+                    };
+                    caller.sendMessage(message);
+                });
+            });
+        });
+    } else {
+        var decline = {
+            id: 'callResponse',
+            response: 'rejected',
+            message: 'user declined'
+        };
+        caller.sendMessage(decline);
+    }
+}
+
+function call(callerId, to, from, sdpOffer) {
+    clearCandidatesQueue(callerId);
+
+    var caller = userRegistry.getById(callerId);
+    var rejectCause = 'User ' + to + ' is not registered';
+    if (userRegistry.getByName(to)) {
+        var callee = userRegistry.getByName(to);
+        caller.sdpOffer = sdpOffer
+        callee.peer = from;
+        caller.peer = to;
+        var message = {
+            id: 'incomingCall',
+            from: from
+        };
+        try {
+            return callee.sendMessage(message);
+        } catch (exception) {
+            rejectCause = "Error " + exception;
+        }
+    }
+    var message = {
+        id: 'callResponse',
+        response: 'rejected: ',
+        message: rejectCause
+    };
+    caller.sendMessage(message);
+}
+
+function register(id, name, ws, callback) {
+    function onError(error) {
+        ws.send(JSON.stringify({id: 'registerResponse', response: 'rejected ', message: error}));
+    }
+
+    if (!name) {
+        return onError("empty user name");
+    }
+
+    if (userRegistry.getByName(name)) {
+        return onError("User " + name + " is already registered");
+    }
+
+    userRegistry.register(new UserSession(id, name, ws));
+    try {
+        ws.send(JSON.stringify({id: 'registerResponse', response: 'accepted'}));
+    } catch (exception) {
+        onError(exception);
+    }
+}
+
+function clearCandidatesQueue(sessionId) {
+    if (candidatesQueue[sessionId]) {
+        delete candidatesQueue[sessionId];
+    }
+}
+
+function onIceCandidate(sessionId, _candidate) {
+    var candidate = kurento.register.complexTypes.IceCandidate(_candidate);
+    var user = userRegistry.getById(sessionId);
+    console.log("Got user.id:", user.id);
+   // console.log("pipelines:", pipelines);
+
+    if (pipelines[user.id] && pipelines[user.id].webRtcEndpoint && pipelines[user.id].webRtcEndpoint[user.id]) {
+     //   console.log("----", pipelines[user.id].webRtcEndpoint, "....", pipelines[user.id].webRtcEndpoint[user.id]);
+        var webRtcEndpoint = pipelines[user.id].webRtcEndpoint[user.id];
+        webRtcEndpoint.addIceCandidate(candidate);
+        console.log('--------ice candidate added');
+    }
+    else {
+        if (!candidatesQueue[user.id]) {
+            candidatesQueue[user.id] = [];
+        }
+        candidatesQueue[sessionId].push(candidate);
+    }
+}
+
+app.use(express.static(path.join(__dirname, 'static')));
+app.use(express.static(path.join(mediaDir)));
