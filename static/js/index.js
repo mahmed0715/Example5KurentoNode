@@ -185,16 +185,16 @@ function playResponse(message) {
 		setCallState(IN_PLAY);
          var src = 'http://'+location.host+'/'+message.uri;
         videoOutput.src = src;
-        alert(src);
+      //  alert(src);
         videoOutput.play();
         videoOutput.addEventListener('ended',function(){
             this.src = '';
             playEnd();
         });
-		webRtcPeer.processAnswer(message.sdpAnswer, function(error) {
-			if (error)
-				return console.error(error);
-		});
+//		webRtcPeer.processAnswer(message.sdpAnswer, function(error) {
+//			if (error)
+//				return console.error(error);
+//		});
       
 	}
 }
